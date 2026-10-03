@@ -64,6 +64,37 @@
         </div>
       </div>
 
+      <!-- 背景图片合成预览 -->
+      <div class="card preview-card" id="previewCard" hidden>
+        <div class="card-head">
+          <h2>背景图片合成预览 <span class="hint">（把当前最佳叠序应用到背景 PNG，可下载）</span></h2>
+          <span id="previewStatus" class="status"></span>
+        </div>
+        <div id="previewBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              背景图片（PNG、RGB 模式、不超过 2 MiB、宽高均不超过 512 像素；不缩放、不转换）
+            </div>
+            <div class="preview-file-row">
+              <input id="previewFile" data-act="preview-file" type="file"
+                     accept="image/png,.png,image/apng" />
+              <span id="previewFileMeta" class="hint"></span>
+            </div>
+          </div>
+          <div class="infer-field">
+            <div class="infer-field-label">本次合成采用的底 → 顶叠序（固定为当前有效的最佳叠序，不重新择序）</div>
+            <div id="previewOrder" class="infer-order"></div>
+          </div>
+          <div class="infer-actions">
+            <button id="previewRunBtn" class="btn btn-small" data-act="preview-run"
+                    type="button" disabled>生成合成预览</button>
+            <span id="previewHint" class="hint">需先有有效求解结果并选择符合要求的 PNG 图片</span>
+          </div>
+          <div id="previewErrors" class="infer-errors" hidden></div>
+          <div id="previewResult"></div>
+        </div>
+      </div>
+
       <!-- 先后关系成环解除 -->
       <div class="card cycle-card" id="cycleCard" hidden>
         <div class="card-head">

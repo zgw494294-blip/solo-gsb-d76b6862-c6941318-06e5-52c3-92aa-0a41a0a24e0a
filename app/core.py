@@ -126,6 +126,30 @@ def render_stack(
     return out  # type: ignore[return-value]
 
 
+def compose_channel_tables(
+    order: list[int],
+    layer_colors_lin: list[tuple[float, float, float]],
+    layer_alphas: list[float],
+) -> tuple[list[int], list[int], list[int]]:
+    """构建 R/G/B 各 256 项的「背景 8 位色阶 → 合成后 8 位色阶」查表。
+
+    每个通道的合成仅取决于同通道的背景色阶（层颜色与 α 固定、线性光 "over"
+    为逐通道独立运算），故逐色阶复用 render_stack 渲染灰度背景即可复现像素级
+    合成，无需逐像素浮点运算。输出取整与 _sample_details 的 HEX 规则完全一致：
+    先 clamp 到 0～1、乘 255，再做银行家四舍五入（Python round）并夹回 0～255。
+    """
+    tables: list[list[int]] = []
+    for chan in range(3):
+        table = [0] * 256
+        for level in range(256):
+            bg = [0.0, 0.0, 0.0]
+            bg[chan] = level / 255.0
+            out = render_stack((bg[0], bg[1], bg[2]), order, layer_colors_lin, layer_alphas)[chan]
+            table[level] = max(0, min(255, int(round(_clamp01(out) * 255.0))))
+        tables.append(table)
+    return tables[0], tables[1], tables[2]
+
+
 # ----------------------------------------------------------------- 环检测 --
 
 
@@ -821,19 +845,7 @@ def infer_opacities(payload: Any) -> dict[str, Any]:
     order_idx = [parsed.seen_ids[x] for x in order_ids]
 
     # ---- 顺序必须符合先后关系 ---------------------------------------------
-    pos = [0] * n
-    for p, idx in enumerate(order_idx):
-        pos[idx] = p
-    for li, ui in parsed.pairs:
-        if pos[li] >= pos[ui]:
-            raise CalibrationError(
-                [
-                    _err(
-                        "order",
-                        f"所给顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
-                    )
-                ]
-            )
+    _check_order_relations(parsed, order_idx, "order", "所给顺序不符合先后关系：")
 
     # 待调图层按 ID 字典序排列，元组决胜均以此顺序为准
     adjust_ids = sorted(adjust_ids)
@@ -1202,38 +1214,47 @@ def review_measurement(payload: Any) -> dict[str, Any]:
 
 
 def _parse_full_order(
-    raw_order: Any, parsed: _Parsed, errors: list[dict[str, Any]]
+    raw_order: Any,
+    parsed: _Parsed,
+    errors: list[dict[str, Any]],
+    *,
+    field: str = "currentOrder",
+    scope: str = "transition",
 ) -> list[int] | None:
-    """校验「恰好包含全部图层 ID 各一次」的底→顶顺序，成功返回下标序列。"""
+    """校验「恰好包含全部图层 ID 各一次」的底→顶顺序，成功返回下标序列。
+
+    field / scope 用于不同接口的错误口径（过渡规划用 currentOrder/transition，
+    图片合成预览用 order/order）。
+    """
     n = len(parsed.ids)
     id_set = {lid for lid in parsed.ids if lid}
     order_ids: list[str] = []
     ok = True
     if not isinstance(raw_order, list):
         errors.append(
-            _err("transition", "缺少 currentOrder 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
+            _err(scope, f"缺少 {field} 列表或其格式不正确：必须按底→顶顺序给出全部图层 ID")
         )
         return None
     if len(raw_order) != n:
         errors.append(
             _err(
-                "transition",
-                f"currentOrder 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个",
+                scope,
+                f"{field} 必须恰好包含全部 {n} 个图层 ID（各一次），当前 {len(raw_order)} 个",
             )
         )
         ok = False
     seen: set[str] = set()
     for x in raw_order:
         if not isinstance(x, str) or not x.strip():
-            errors.append(_err("transition", f"currentOrder 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
+            errors.append(_err(scope, f"{field} 中的图层 ID 非法：{x!r}（必须是已存在的图层 ID）"))
             ok = False
             continue
         x = x.strip()
         if x not in id_set:
-            errors.append(_err("transition", f"currentOrder 中的图层 ID 不存在：{x!r}"))
+            errors.append(_err(scope, f"{field} 中的图层 ID 不存在：{x!r}"))
             ok = False
         elif x in seen:
-            errors.append(_err("transition", f"currentOrder 中图层 ID 重复：{x}，每个图层必须且只能出现一次"))
+            errors.append(_err(scope, f"{field} 中图层 ID 重复：{x}，每个图层必须且只能出现一次"))
             ok = False
         else:
             seen.add(x)
@@ -1241,6 +1262,25 @@ def _parse_full_order(
     if not ok:
         return None
     return [parsed.seen_ids[x] for x in order_ids]
+
+
+def _check_order_relations(
+    parsed: _Parsed, order_idx: list[int], scope: str, prefix: str
+) -> None:
+    """给定底→顶顺序若不符合先后关系，抛出 CalibrationError；prefix 为消息前缀。"""
+    pos = [0] * len(order_idx)
+    for p, idx in enumerate(order_idx):
+        pos[idx] = p
+    for li, ui in parsed.pairs:
+        if pos[li] >= pos[ui]:
+            raise CalibrationError(
+                [
+                    _err(
+                        scope,
+                        f"{prefix}{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
+                    )
+                ]
+            )
 
 
 def plan_transition(payload: Any) -> dict[str, Any]:
@@ -1267,19 +1307,7 @@ def plan_transition(payload: Any) -> dict[str, Any]:
     n = len(parsed.ids)
 
     # ---- 当前顺序必须符合全部先后关系 -------------------------------------
-    pos = [0] * n
-    for p, idx in enumerate(current_idx):
-        pos[idx] = p
-    for li, ui in parsed.pairs:
-        if pos[li] >= pos[ui]:
-            raise CalibrationError(
-                [
-                    _err(
-                        "transition",
-                        f"当前顺序不符合先后关系：{parsed.ids[li]} 必须在 {parsed.ids[ui]} 下方（底 → 顶）",
-                    )
-                ]
-            )
+    _check_order_relations(parsed, current_idx, "transition", "当前顺序不符合先后关系：")
 
     # ---- 枚举全部合规叠序及旧样本总误差 ------------------------------------
     # 所有比较与展示统一使用 _sample_details 口径（与 /api/solve 的 totalSse

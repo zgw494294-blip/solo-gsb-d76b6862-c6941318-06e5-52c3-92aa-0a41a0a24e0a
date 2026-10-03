@@ -782,3 +782,59 @@ input[type="color"] {
 }
 .diag-sample-row .hint b { color: var(--ink); font-weight: 600; }
 .diag-sample-tag { color: var(--ink-soft); }
+
+/* ------------------------- 背景图片合成预览 ------------------------- */
+.preview-card { margin-top: 16px; }
+.preview-file-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.preview-file-bad { color: var(--danger); font-weight: 600; }
+.btn-disabled {
+  opacity: 0.45;
+  pointer-events: none;
+  cursor: not-allowed;
+}
+.preview-stage {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.preview-cell {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.preview-cell figcaption {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.preview-imgbox {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  line-height: 0;
+  max-width: 100%;
+}
+.preview-imgbox img {
+  display: block;
+  max-width: 100%;
+  width: auto;
+  height: auto;
+  image-rendering: pixelated;
+}
+.preview-order-cell {
+  flex: 1 1 220px;
+  min-width: 200px;
+}
+.preview-order-cell .btn {
+  align-self: flex-start;
+  margin-top: 8px;
+  text-decoration: none;
+  display: inline-block;
+}

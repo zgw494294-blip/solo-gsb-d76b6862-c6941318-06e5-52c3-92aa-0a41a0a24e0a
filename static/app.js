@@ -31,6 +31,7 @@ let solveInputEpoch = 0;
 
 function noteSolveInputChanged() {
   solveInputEpoch += 1;
+  markPreviewStaleness();
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -510,6 +511,7 @@ function showErrors(errors) {
   elStatus.className = "status";
   elResultBody.innerHTML = `<div class="result-empty">修正输入后将自动重新计算。</div>`;
   $("#inferCard").hidden = true;
+  setPreviewSolveResult(null);
 }
 
 // ------------------------------------------------------------ 结果渲染 --
@@ -557,6 +559,7 @@ function renderResult(r) {
   renderReviewBgOptions();
   syncInferPanel(r);
   syncTransitionPanel(r);
+  syncPreviewPanel(r);
 }
 
 function renderSample(s) {
@@ -946,6 +949,8 @@ document.addEventListener("change", (e) => {
   } else if (act === "review-bg") {
     reviewState.selectedBackground = t.value;
     markReviewStaleness();
+  } else if (act === "preview-file") {
+    void handlePreviewFileChange(t);
   }
 });
 
@@ -972,6 +977,15 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "transition-run") runTransition();
   if (btn.dataset.act === "transition-reset") resetTransitionOrder();
   if (btn.dataset.act === "cycle-confirm") confirmCyclePlan();
+  if (btn.dataset.act === "preview-run") void runPreview();
+});
+
+// 失效预览的下载链接只作展示：点击直接拦截，绝不触发下载 / 导航
+document.addEventListener("click", (e) => {
+  const dl = e.target.closest('a[data-act="preview-download"]');
+  if (dl && dl.classList.contains("btn-disabled")) {
+    e.preventDefault();
+  }
 });
 
 // 响应守卫：只有「当前在途请求」且「发出后参与输入未再变化」的响应可以落地。
@@ -2174,6 +2188,367 @@ async function confirmCyclePlan() {
     elCycleStatus.className = "status";
     showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
   }
+}
+
+// ======================================================== 背景图片合成预览 ==
+
+// 规则要点：
+// - 只在「存在有效求解结果」时可生成；顺序固定为该结果的底→顶顺序，不重新择序。
+// - 预览的输入纪元 = 校准输入纪元 solveInputEpoch（图层/样本/关系变化即 +1）+
+//   图片纪元（选择/更换文件即 +1）。两类纪元任一变化，旧预览立即失去下载资格，
+//   改回原值也不恢复（纪元只增不减）。
+// - 连续生成只接纳「最近一次请求且其发出后输入未变」的响应；上传或响应体（Blob）
+//   读取期间输入发生变化，旧结果同样丢弃。
+const previewState = {
+  solveOrder: null,    // 当前有效求解结果的底→顶 ID 顺序；null 表示无有效结果
+  solveEpoch: 0,       // 该求解结果对应的校准输入纪元
+  file: null,          // 当前选中的 File
+  fileEpoch: 0,        // 图片纪元（只增不减）
+  fileError: "",       // 选中图片的本地校验错误
+  result: null,        // { blobUrl, order, inputEpoch, fileEpoch, originUrl }
+  inflightId: 0,       // 当前仍可落地的在途请求序号；0 表示无
+  inflightEpoch: 0,    // 在途请求发出时的校准输入纪元
+  inflightFileEpoch: 0,// 在途请求发出时的图片纪元
+  reqSeq: 0,           // 单调递增的请求序号源，永不归零
+};
+
+const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const PREVIEW_MAX_SIDE = 512;
+
+const elPreviewCard = $("#previewCard");
+const elPreviewResult = $("#previewResult");
+const elPreviewErrors = $("#previewErrors");
+const elPreviewStatus = $("#previewStatus");
+const elPreviewFile = $("#previewFile");
+const elPreviewFileMeta = $("#previewFileMeta");
+const elPreviewRunBtn = $("#previewRunBtn");
+const elPreviewHint = $("#previewHint");
+
+function setPreviewSolveResult(solveResult) {
+  // 无有效求解结果：卡片保留但禁用生成；旧结果立刻随 solveEpoch 不匹配而失效
+  previewState.solveOrder = solveResult ? [...solveResult.order] : null;
+  previewState.solveEpoch = solveInputEpoch;
+  elPreviewCard.hidden = false;
+  renderPreviewOrder();
+  refreshPreviewControls();
+  markPreviewStaleness();
+}
+
+function syncPreviewPanel(solveResult) {
+  setPreviewSolveResult(solveResult);
+}
+
+function renderPreviewOrder() {
+  const box = $("#previewOrder");
+  box.innerHTML = "";
+  if (!previewState.solveOrder) return;
+  previewState.solveOrder.forEach((id, pos) => {
+    const layer = layerById(id);
+    const hex = (layer && normalizeHex(layer.color)) || "#000000";
+    const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+    const slot = document.createElement("span");
+    slot.className = "order-slot";
+    slot.innerHTML = `
+      <span class="mini-dot" style="background:${hexToRgba(hex, op)}"></span>
+      <span class="slot-id">${escapeHtml(id)}</span>
+      <span class="mini-op">α=${Number(op.toFixed(2))}</span>
+    `;
+    box.appendChild(slot);
+    if (pos < previewState.solveOrder.length - 1) {
+      const ar = document.createElement("span");
+      ar.className = "infer-arrow";
+      ar.textContent = "↑";
+      box.appendChild(ar);
+    }
+  });
+}
+
+// 轻量本地预检（服务端仍做权威校验）：PNG 签名、IHDR 色型（2=RGB）与宽高、体积
+function parsePngMeta(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve({ error: "图片无法读取，请重新选择文件" });
+    reader.onload = () => {
+      const b = new Uint8Array(reader.result);
+      const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+      if (b.length < 26 || sig.some((v, i) => b[i] !== v)) {
+        resolve({ error: "仅支持 PNG 图片（缺少 PNG 签名），不做格式转换" });
+        return;
+      }
+      // IHDR：偏移 16 起为宽(4) 高(4) 位深(1) 色型(1)
+      const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+      const width = dv.getUint32(16);
+      const height = dv.getUint32(20);
+      const colorType = b[25];
+      if (colorType !== 2) {
+        resolve({ error: "仅支持 RGB 模式 PNG（IHDR 色型须为 2），不做模式转换" });
+        return;
+      }
+      if (width < 1 || height < 1 || width > PREVIEW_MAX_SIDE || height > PREVIEW_MAX_SIDE) {
+        resolve({ error: `图片宽高必须均为 1～${PREVIEW_MAX_SIDE} 像素，实际为 ${width}×${height}` });
+        return;
+      }
+      resolve({ width, height });
+    };
+    reader.readAsArrayBuffer(file.slice(0, 32));
+  });
+}
+
+async function handlePreviewFileChange(input) {
+  const file = input.files && input.files[0] ? input.files[0] : null;
+  // 任何文件变化（含清空、换图）都推进图片纪元：旧预览、旧在途请求立即失效
+  previewState.fileEpoch += 1;
+  previewState.file = file;
+  previewState.fileError = "";
+  if (!file) {
+    elPreviewFileMeta.textContent = "未选择图片";
+    refreshPreviewControls();
+    markPreviewStaleness();
+    return;
+  }
+  const myFileEpoch = previewState.fileEpoch;
+  if (file.size > PREVIEW_MAX_BYTES) {
+    previewState.fileError = `图片大小 ${formatBytes(file.size)}，超过 2 MiB 上限`;
+  } else {
+    elPreviewFileMeta.textContent = `${file.name} · ${formatBytes(file.size)} · 校验中…`;
+    const meta = await parsePngMeta(file);
+    // 等待期间又换过文件：本次校验结果作废，以最新一次 handle 为准
+    if (myFileEpoch !== previewState.fileEpoch || previewState.file !== file) return;
+    if (meta.error) {
+      previewState.fileError = meta.error;
+    } else {
+      elPreviewFileMeta.textContent =
+        `${file.name} · ${formatBytes(file.size)} · PNG/RGB · ${meta.width}×${meta.height}`;
+    }
+  }
+  refreshPreviewControls();
+  markPreviewStaleness();
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MiB`;
+}
+
+// 预览资格（含下载资格）：结果存在、请求对应输入与当前完全一致（校准纪元 + 图片纪元）
+function previewResultFresh() {
+  const r = previewState.result;
+  return (
+    !!r &&
+    r.inputEpoch === solveInputEpoch &&
+    r.fileEpoch === previewState.fileEpoch &&
+    r.order.length === (previewState.solveOrder || []).length &&
+    r.order.every((id, k) => id === previewState.solveOrder[k])
+  );
+}
+
+function refreshPreviewControls() {
+  const file = previewState.file;
+  if (previewState.fileError) {
+    elPreviewFileMeta.textContent = previewState.fileError;
+    elPreviewFileMeta.classList.add("preview-file-bad");
+  } else if (file) {
+    elPreviewFileMeta.classList.remove("preview-file-bad");
+  }
+  const canRun =
+    !!previewState.solveOrder &&
+    !!file &&
+    !previewState.fileError &&
+    file.size <= PREVIEW_MAX_BYTES;
+  elPreviewRunBtn.disabled = !canRun;
+  if (!previewState.solveOrder) {
+    elPreviewHint.textContent = "当前没有有效求解结果，无法生成（修正输入后自动重新求解）";
+  } else if (!file) {
+    elPreviewHint.textContent = "请先选择一张符合要求的背景 PNG 图片";
+  } else if (previewState.fileError) {
+    elPreviewHint.textContent = "图片不符合要求，无法生成";
+  } else {
+    elPreviewHint.textContent =
+      "顺序固定为当前最佳叠序；不缩放、不重新择序、不改输入，输出同尺寸 RGB PNG";
+  }
+}
+
+// 输入变化（图层/样本/关系经 noteSolveInputChanged 进入，或图片纪元变化后调用）：
+// 在途请求立即作废并结束加载态；已展示结果失去下载资格（即使之后改回原值）。
+function markPreviewStaleness() {
+  if (previewState.inflightId !== 0) {
+    const stillSame =
+      previewState.inflightEpoch === solveInputEpoch &&
+      previewState.inflightFileEpoch === previewState.fileEpoch;
+    if (!stillSame) {
+      previewState.inflightId = 0;
+      previewState.inflightEpoch = 0;
+      previewState.inflightFileEpoch = 0;
+      elPreviewStatus.textContent = "";
+      elPreviewStatus.className = "status";
+    }
+  }
+  if (!previewState.result) {
+    refreshPreviewControls();
+    return;
+  }
+  const fresh = previewResultFresh();
+  const stale = elPreviewResult.querySelector(".stale-note");
+  const dl = elPreviewResult.querySelector('a[data-act="preview-download"]');
+  if (!fresh) {
+    if (!stale) {
+      const note = document.createElement("div");
+      note.className = "stale-note";
+      note.textContent =
+        "图层、样本、关系或背景图片已变化，本预览已失效且不能下载（改回原值也不恢复），请重新生成。";
+      elPreviewResult.prepend(note);
+    }
+    if (dl) dl.classList.add("btn-disabled");
+  } else if (stale) {
+    stale.remove();
+    if (dl) dl.classList.remove("btn-disabled");
+  }
+  refreshPreviewControls();
+}
+
+async function runPreview() {
+  if (elPreviewRunBtn.disabled) return;
+  const order = previewState.solveOrder;
+  const file = previewState.file;
+  if (!order || !file || previewState.fileError) return;
+
+  const payload = {
+    ...buildSolvePayload(),
+    order,
+  };
+  const form = new FormData();
+  form.append("payload", JSON.stringify(payload));
+  form.append("image", file, file.name || "background.png");
+
+  // 单调递增序号：连续生成只接纳最近一次请求；序号永不复用
+  const reqId = ++previewState.reqSeq;
+  previewState.inflightId = reqId;
+  previewState.inflightEpoch = solveInputEpoch;
+  previewState.inflightFileEpoch = previewState.fileEpoch;
+  elPreviewStatus.textContent = "上传并合成中…";
+  elPreviewStatus.className = "status busy";
+  elPreviewErrors.hidden = true;
+
+  const isCurrent = () =>
+    previewState.inflightId === reqId &&
+    previewState.inflightEpoch === solveInputEpoch &&
+    previewState.inflightFileEpoch === previewState.fileEpoch;
+
+  let resp;
+  try {
+    resp = await fetch("/api/compose-preview", { method: "POST", body: form });
+    // 响应头到达后：上传期间输入若已变，旧请求立即作废（Blob 也不必再读）
+    if (!isCurrent()) return;
+  } catch (err) {
+    if (!isCurrent()) return;
+    previewState.inflightId = 0;
+    elPreviewStatus.textContent = "";
+    elPreviewStatus.className = "status";
+    showPreviewErrors([{ message: "无法连接计算服务：" + err.message }]);
+    return;
+  }
+
+  // 成功响应为 image/png；错误响应为 JSON（二者都要在 Blob 读完后再过一次守卫）
+  const ct = resp.headers.get("content-type") || "";
+  let blob;
+  try {
+    blob = await resp.blob();
+  } catch (err) {
+    if (!isCurrent()) return;
+    previewState.inflightId = 0;
+    elPreviewStatus.textContent = "";
+    elPreviewStatus.className = "status";
+    showPreviewErrors([{ message: "响应读取失败：" + err.message }]);
+    return;
+  }
+  // 响应体（上传结果 / 图片 Blob）读取期间输入可能变化或已有更新请求：落地前再判
+  if (!isCurrent()) return;
+  previewState.inflightId = 0;
+  elPreviewStatus.textContent = "";
+  elPreviewStatus.className = "status";
+
+  if (!resp.ok || ct.indexOf("application/json") !== -1) {
+    let errors = [{ message: "合成预览失败" }];
+    try {
+      const data = JSON.parse(await blob.text());
+      if (Array.isArray(data.errors) && data.errors.length) errors = data.errors;
+    } catch (_) { /* 保留默认错误 */ }
+    // 生成失败不改校准输入，也不产生新预览
+    showPreviewErrors(errors);
+    return;
+  }
+  if (ct.indexOf("image/png") === -1) {
+    showPreviewErrors([{ message: "服务端返回了非 PNG 内容，合成失败" }]);
+    return;
+  }
+
+  // 旧结果（含原图预览 URL）被新结果替换时统一回收
+  if (previewState.result) {
+    URL.revokeObjectURL(previewState.result.blobUrl);
+    URL.revokeObjectURL(previewState.result.originUrl);
+  }
+  previewState.result = {
+    blobUrl: URL.createObjectURL(blob),
+    originUrl: file ? URL.createObjectURL(file) : "",
+    order: [...order],
+    inputEpoch: solveInputEpoch,
+    fileEpoch: previewState.fileEpoch,
+  };
+  renderPreviewResult();
+}
+
+function showPreviewErrors(errors) {
+  elPreviewErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elPreviewErrors.hidden = false;
+}
+
+function renderPreviewResult() {
+  elPreviewErrors.hidden = true;
+  const r = previewState.result;
+  const orderText = r.order
+    .map((id) => {
+      const layer = layerById(id);
+      const hex = (layer && normalizeHex(layer.color)) || "#000000";
+      const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+      return `<span class="chip">
+          <span class="dot" style="background:${hexToRgba(hex, op)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+          <span class="cop">α=${Number(op.toFixed(2))}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+  const html = `
+    <div class="preview-stage">
+      <figure class="preview-cell">
+        <figcaption>原图</figcaption>
+        <div class="preview-imgbox checker">
+          <img src="${r.originUrl}" alt="背景原图" />
+        </div>
+      </figure>
+      <figure class="preview-cell">
+        <figcaption>合成图（当前最佳叠序）</figcaption>
+        <div class="preview-imgbox checker">
+          <img src="${r.blobUrl}" alt="合成预览" />
+        </div>
+      </figure>
+      <figure class="preview-cell preview-order-cell">
+        <figcaption>底 → 顶顺序</figcaption>
+        <div class="checker">
+          <div class="order-chips preview-order-chips">
+            <span class="order-ends">底</span>
+            ${orderText}
+            <span class="order-ends">↑ 顶</span>
+          </div>
+        </div>
+        <a class="btn btn-small" data-act="preview-download"
+           href="${r.blobUrl}" download="composite-preview.png">下载合成 PNG</a>
+      </figure>
+    </div>
+  `;
+  elPreviewResult.innerHTML = html;
+  markPreviewStaleness();
 }
 
 // ------------------------------------------------------------ 启动 --
