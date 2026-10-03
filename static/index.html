@@ -53,6 +53,30 @@
 
     <!-- ================= 右栏：结果 ================= -->
     <section class="col-result">
+      <!-- 背景图片合成预览 -->
+      <div class="card composite-card" id="compositeCard">
+        <div class="card-head">
+          <h2>背景图片合成预览 <span class="hint">（把当前有效最佳叠序叠到上传图片上）</span></h2>
+          <span id="compositeStatus" class="status"></span>
+        </div>
+        <div id="compositeBody">
+          <div class="infer-field">
+            <div class="infer-field-label">
+              背景图片（PNG、RGB 模式、不超过 2 MiB、宽高各不超过 512 像素；服务端不缩放）
+            </div>
+            <input id="compositeFile" type="file" accept="image/png,.png" />
+            <span id="compositeFileHint" class="hint"></span>
+          </div>
+          <div class="infer-actions">
+            <button id="compositeRunBtn" class="btn btn-small" data-act="composite-run"
+                    type="button" disabled>生成合成预览</button>
+            <span id="compositeHint" class="hint">没有有效求解结果时无法生成</span>
+          </div>
+          <div id="compositeErrors" class="infer-errors" hidden></div>
+          <div id="compositeResult"></div>
+        </div>
+      </div>
+
       <div class="card result-card">
         <div class="card-head">
           <h2>校准结果</h2>

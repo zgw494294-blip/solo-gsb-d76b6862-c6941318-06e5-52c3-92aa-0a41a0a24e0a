@@ -31,6 +31,7 @@ let solveInputEpoch = 0;
 
 function noteSolveInputChanged() {
   solveInputEpoch += 1;
+  markCompositeStaleness(); // 图层 / 样本 / 关系变化也立即撤销旧合成预览的下载资格
 }
 
 const $ = (sel) => document.querySelector(sel);
@@ -470,6 +471,8 @@ async function runSolve() {
     if (!resp.ok) {
       const errors = data.errors || [{ scope: "form", message: "求解失败" }];
       showErrors(errors);
+      lastSolveResult = null; // 无有效求解结果：禁用合成预览生成
+      updateCompositeRunBtn();
       // 是否成环、以及待确认解除方案，都以 /api/resolve-cycle 的判定为准；
       // 其他非法输入（无环 / 混有别的错误）时该伴随请求不会展示方案卡片。
       void runCyclePlan(payload, { silentOnError: true });
@@ -478,10 +481,12 @@ async function runSolve() {
       lastSolveResult = data;
       clearCyclePlan();
       renderResult(data);
+      updateCompositeRunBtn();
     }
   } catch (err) {
     if (!solveResponseCurrent(token, epoch)) return;
     showErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
+    updateCompositeRunBtn();
   }
 }
 
@@ -2175,6 +2180,316 @@ async function confirmCyclePlan() {
     showCycleErrors([{ scope: "form", message: "无法连接计算服务：" + err.message }]);
   }
 }
+
+// ============================================================ 背景图片合成预览 ==
+
+// 把「当前有效的最佳叠序」（最近一次成功求解的 order）叠到上传的背景图每个像素上。
+//
+// 失效与请求竞态规则（与求解 / 反推 / 过渡同样严格）：
+//  - 合成纪元 epoch：图层、样本、关系（走 noteSolveInputChanged）或已选图片
+//    每次变化都 +1，只增不减；旧预览的下载资格立即撤销，即使把输入或图片改回原值
+//    也不会恢复（纪元不回落）。
+//  - 合成请求 reqSeq：永不归零的单调序号；连续生成只接纳「最近一次且输入未变」的请求，
+//    上传或图片解码（响应体读取）期间输入 / 图片发生变化也丢弃旧结果。
+//  - 没有有效求解结果（尚无成功求解、或当前输入有错误）时禁用生成；生成失败不改动
+//    任何校准输入。
+const compositeState = {
+  file: null,          // 当前选中的 File（未重新上传即不变）
+  fileMeta: "",        // 展示用「文件名 W×H」
+  epoch: 0,            // 图层 / 样本 / 关系 / 图片纪元（只增不减）
+  result: null,        // 最近一次仍有效的 { blobUrl, origUrl, order, width, height }
+  invalidated: false,  // 当前展示的预览是否已失去下载资格（一旦置位不复位）
+  inflightId: 0,       // 当前仍可落地的在途请求序号；0 表示无
+  inflightEpoch: 0,    // 在途请求发出时的纪元
+  reqSeq: 0,           // 单调递增请求序号源，永不归零
+};
+
+const elCompositeStatus = $("#compositeStatus");
+const elCompositeFile = $("#compositeFile");
+const elCompositeFileHint = $("#compositeFileHint");
+const elCompositeRunBtn = $("#compositeRunBtn");
+const elCompositeHint = $("#compositeHint");
+const elCompositeErrors = $("#compositeErrors");
+const elCompositeResult = $("#compositeResult");
+
+// 图层 / 样本 / 关系变化时由 noteSolveInputChanged 调用；图片变化时在选择处理里调用
+function markCompositeStaleness() {
+  // 在途请求若发出后纪元已变，立即摘除其在途身份并结束加载态；
+  // 旧响应返回后（含上传 / 读取响应体期间的变化）一律在守卫处丢弃。
+  if (compositeState.inflightId !== 0 &&
+      compositeState.epoch !== compositeState.inflightEpoch) {
+    compositeState.inflightId = 0;
+    compositeState.inflightEpoch = 0;
+    elCompositeStatus.textContent = "";
+    elCompositeStatus.className = "status";
+  }
+  updateCompositeRunBtn();
+  if (!compositeState.result) return;
+  // 已展示预览一旦在生成后遇到任何相关变化（含把输入 / 图片改回原值），下载资格
+  // 永久撤销：epoch 只增不减、invalidated 一旦置位不复位。
+  if (compositeState.epoch !== compositeState.result.epoch) {
+    compositeState.invalidated = true;
+  }
+  renderCompositeResultIfAny();
+}
+
+function updateCompositeRunBtn() {
+  const can = !!lastSolveResult && !!compositeState.file && compositeState.inflightId === 0;
+  elCompositeRunBtn.disabled = !can;
+  if (!lastSolveResult) {
+    elCompositeHint.textContent = "没有有效求解结果时无法生成";
+  } else if (!compositeState.file) {
+    elCompositeHint.textContent = "请先选择一张不超过 2 MiB、宽高各不超过 512 像素的 RGB PNG 背景图";
+  } else if (compositeState.inflightId !== 0) {
+    elCompositeHint.textContent = "正在生成…";
+  } else {
+    elCompositeHint.textContent = "固定使用当前最优叠序，逐像素线性光合成，输出同尺寸 RGB PNG";
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-act]");
+  if (btn && btn.dataset.act === "composite-run") void runComposite();
+});
+
+elCompositeFile.addEventListener("change", () => {
+  const file = elCompositeFile.files && elCompositeFile.files[0] ? elCompositeFile.files[0] : null;
+  void selectCompositeFile(file);
+});
+
+async function selectCompositeFile(file) {
+  // 换新文件（含清空选择）即相关输入变化：纪元 +1，旧预览立即失去下载资格。
+  // 记下本次选择的纪元：probeImage 是异步的，快速连续选两次时，较早一次的解码
+  // 可能在较新一次之后才完成——落地前必须确认纪元未变，否则旧结果一律丢弃。
+  const selectEpoch = compositeState.epoch + 1;
+  compositeState.epoch = selectEpoch;
+  compositeState.file = null;
+  elCompositeFileHint.textContent = "";
+  if (!file) {
+    showCompositeErrors([]);
+    markCompositeStaleness();
+    return;
+  }
+  // 客户端预检：扩展名 / MIME、体积；再用浏览器解码确认可解码与尺寸（最终以服务端判定为准）。
+  const errs = [];
+  const nameOk = /\.png$/i.test(file.name) || file.type === "image/png";
+  if (!nameOk) errs.push("文件必须是 PNG 格式（不接受 JPEG / GIF / WebP 等）");
+  if (file.size > 2 * 1024 * 1024) {
+    errs.push(`图片体积 ${file.size} 字节超出 2 MiB（2097152 字节）上限`);
+  }
+  let dims = null;
+  if (nameOk && file.size <= 2 * 1024 * 1024) {
+    try {
+      dims = await probeImage(file);
+    } catch (msg) {
+      errs.push(msg);
+    }
+  }
+  // 解码期间用户又选了别的文件 / 改了校准输入：本次选择整体作废，不得覆盖较新状态
+  if (compositeState.epoch !== selectEpoch) return;
+  if (dims && (dims.width > 512 || dims.height > 512)) {
+    errs.push(`图片尺寸 ${dims.width}×${dims.height} 超出上限：宽、高均不得超过 512 像素（不会缩放）`);
+  }
+  if (errs.length) {
+    showCompositeErrors(errs.map((m) => ({ scope: "image", message: m })));
+    compositeState.file = null;
+    elCompositeFileHint.textContent = "";
+    markCompositeStaleness();
+    return;
+  }
+  showCompositeErrors([]);
+  compositeState.file = file;
+  compositeState.fileMeta = `${file.name} · ${dims.width}×${dims.height} · ${file.size} 字节`;
+  elCompositeFileHint.textContent = compositeState.fileMeta;
+  markCompositeStaleness();
+}
+
+// 浏览器无法区分全不透明 RGBA 与 RGB PNG（位图一律解成可绘制 RGBA），因此这里只预检
+// 可解码性与尺寸；RGB 模式由服务端严格校验并明确报错（最终判定以服务端为准）。
+function probeImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    let settled = false;
+    img.onload = () => {
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        URL.revokeObjectURL(url);
+        resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      };
+      // decode() 能把部分「load 成功但像素不完整」的损坏文件也暴露出来
+      if (img.decode) {
+        img.decode().then(done).catch(() => {
+          if (settled) return;
+          settled = true;
+          URL.revokeObjectURL(url);
+          reject("图片已损坏或无法解码：请确认上传的是完整、未加密的 PNG 图片");
+        });
+      } else {
+        done();
+      }
+    };
+    img.onerror = () => {
+      if (settled) return;
+      settled = true;
+      URL.revokeObjectURL(url);
+      reject("图片已损坏或无法解码：请确认上传的是完整、未加密的 PNG 图片");
+    };
+    img.src = url;
+  });
+}
+
+function compositeResponseCurrent(reqId, reqEpoch) {
+  return (
+    compositeState.inflightId === reqId &&
+    compositeState.inflightEpoch === reqEpoch &&
+    compositeState.epoch === reqEpoch
+  );
+}
+
+async function runComposite() {
+  const solve = lastSolveResult;
+  if (!solve || !compositeState.file || compositeState.inflightId !== 0) return;
+  const reqId = ++compositeState.reqSeq;
+  const reqEpoch = compositeState.epoch;
+  compositeState.inflightId = reqId;
+  compositeState.inflightEpoch = reqEpoch;
+  updateCompositeRunBtn();
+  elCompositeStatus.textContent = "生成中…";
+  elCompositeStatus.className = "status busy";
+
+  const payload = {
+    ...buildSolvePayload(),
+    // 固定使用当前有效最佳叠序：不重新择序；服务端还会校验其完整性与先后关系
+    order: solve.order,
+  };
+  const fd = new FormData();
+  fd.append("payload", JSON.stringify(payload));
+  fd.append("image", compositeState.file);
+
+  try {
+    const resp = await fetch("/api/composite-preview", { method: "POST", body: fd });
+    if (!compositeResponseCurrent(reqId, reqEpoch)) return; // 上传期间已有变化 / 更新请求
+    const blob = await resp.blob(); // 响应体读取窗口：读完后再过一次守卫
+    if (!compositeResponseCurrent(reqId, reqEpoch)) return;
+    compositeState.inflightId = 0;
+    compositeState.inflightEpoch = 0;
+    elCompositeStatus.textContent = "";
+    elCompositeStatus.className = "status";
+    if (!resp.ok) {
+      let errs = [{ scope: "form", message: "合成预览生成失败" }];
+      try {
+        const data = JSON.parse(await blob.text());
+        if (Array.isArray(data.errors) && data.errors.length) errs = data.errors;
+      } catch (_) { /* 保留兜底错误 */ }
+      showCompositeErrors(errs);
+      updateCompositeRunBtn();
+      return;
+    }
+    showCompositeErrors([]);
+    revokeCompositeResultUrls();
+    compositeState.result = {
+      blobUrl: URL.createObjectURL(blob),
+      origUrl: URL.createObjectURL(compositeState.file),
+      order: resp.headers.get("X-Composite-Order")
+        ? JSON.parse(resp.headers.get("X-Composite-Order"))
+        : [...solve.order],
+      width: Number(resp.headers.get("X-Composite-Width")),
+      height: Number(resp.headers.get("X-Composite-Height")),
+      epoch: reqEpoch,
+    };
+    compositeState.invalidated = false;
+    renderCompositeResultIfAny();
+    updateCompositeRunBtn();
+  } catch (err) {
+    if (!compositeResponseCurrent(reqId, reqEpoch)) return;
+    compositeState.inflightId = 0;
+    compositeState.inflightEpoch = 0;
+    elCompositeStatus.textContent = "";
+    elCompositeStatus.className = "status";
+    showCompositeErrors([{ scope: "form", message: "无法连接合成服务：" + err.message }]);
+    updateCompositeRunBtn();
+  }
+}
+
+function revokeCompositeResultUrls() {
+  const r = compositeState.result;
+  if (!r) return;
+  URL.revokeObjectURL(r.blobUrl);
+  URL.revokeObjectURL(r.origUrl);
+  compositeState.result = null;
+}
+
+function showCompositeErrors(errors) {
+  if (!errors.length) {
+    elCompositeErrors.hidden = true;
+    elCompositeErrors.innerHTML = "";
+    return;
+  }
+  elCompositeErrors.innerHTML =
+    "<ul>" + errors.map((er) => `<li>${escapeHtml(er.message)}</li>`).join("") + "</ul>";
+  elCompositeErrors.hidden = false;
+}
+
+function renderCompositeResultIfAny() {
+  const r = compositeState.result;
+  if (!r) {
+    elCompositeResult.innerHTML = "";
+    return;
+  }
+  const dead = compositeState.invalidated || compositeState.epoch !== r.epoch;
+  const chips = r.order
+    .map((id) => {
+      const layer = layerById(id);
+      const hex = (layer && normalizeHex(layer.color)) || "#000000";
+      const op = layer && Number.isFinite(layer.opacity) ? layer.opacity : 1;
+      return `
+        <span class="chip">
+          <span class="dot" style="background:${hexToRgba(hex, op)}" title="${escapeHtml(id)}"></span>
+          <span class="cid">${escapeHtml(id)}</span>
+        </span>`;
+    })
+    .join('<span class="order-sep">↑</span>');
+
+  elCompositeResult.innerHTML = `
+    ${dead
+      ? '<div class="stale-note">图层、样本、关系或背景图片已变化，以下旧预览已失去下载资格（即使改回原值也不恢复），请重新生成。</div>'
+      : ""}
+    <div class="composite-preview-grid">
+      <figure class="composite-fig">
+        <figcaption>原图（${r.width}×${r.height}）</figcaption>
+        <img src="${r.origUrl}" alt="原图" class="composite-img" />
+      </figure>
+      <span class="compare-arrow">→</span>
+      <figure class="composite-fig">
+        <figcaption>合成图（${r.width}×${r.height}，RGB PNG）</figcaption>
+        <img src="${r.blobUrl}" alt="合成图" class="composite-img" />
+      </figure>
+    </div>
+    <div class="composite-order-line">
+      <span class="hint">所用底 → 顶顺序：</span>
+      <span class="checker"><span class="order-chips">
+        <span class="order-ends">底</span>${chips}<span class="order-ends">↑ 顶</span>
+      </span></span>
+    </div>
+    <div class="infer-apply-row">
+      <a class="btn btn-small composite-download${dead ? " is-disabled" : ""}"
+         ${dead ? 'aria-disabled="true"' : `href="${r.blobUrl}" download="composite-preview.png"`}>
+        下载合成 PNG
+      </a>
+      <span class="hint">逐像素复用现有线性光合成，按现有 HEX 取整规则输出；不缩放、不重新择序</span>
+    </div>
+  `;
+  if (dead) {
+    const a = elCompositeResult.querySelector(".composite-download");
+    if (a) a.addEventListener("click", (ev) => ev.preventDefault());
+  }
+}
+
+window.addEventListener("beforeunload", () => {
+  revokeCompositeResultUrls();
+});
 
 // ------------------------------------------------------------ 启动 --
 render();
